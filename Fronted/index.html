@@ -1,0 +1,203 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Proctoring Demo</title>
+  <style>
+    video { width:640px; height:480px; border:1px solid #ccc }
+    button { margin: 5px; padding: 8px 12px; }
+  </style>
+</head>
+<body>
+  <h1>Interview — Candidate View</h1>
+  <video id="video" autoplay muted playsinline></video>
+  <div>
+    <button id="startRec">Start Recording</button>
+    <button id="stopRec" disabled>Stop Recording</button>
+    <button onclick="downloadCSV()">Download CSV Report</button>
+    <button onclick="downloadPDF()">Download PDF Report</button>
+  </div>
+  <pre id="log"></pre>
+
+  <!-- TensorFlow Models -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.0.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+  <!-- jsPDF for PDF export -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+  <script>
+  const video = document.getElementById('video');
+  const logEl = document.getElementById('log');
+  let mediaRecorder, recordedChunks=[];
+
+  async function startCamera(){
+    const stream = await navigator.mediaDevices.getUserMedia({video:true,audio:false});
+    video.srcObject = stream;
+    return stream;
+  }
+
+  // Load models
+  let faceModel, objModel;
+  async function loadModels(){
+    faceModel = await blazeface.load();
+    objModel = await cocoSsd.load();
+    appendLog('Models loaded');
+  }
+
+  function appendLog(s){
+    logEl.textContent += new Date().toISOString() + ' - ' + s + '\n';
+  }
+
+  // Detection state
+  let noFaceStart = null;
+  let lookAwayStart = null;
+  let checkIntervalMs = 600; // run detection ~every 600ms
+
+  async function detectLoop(){
+    if(!faceModel) return;
+    const predictions = await faceModel.estimateFaces(video, false);
+    const now = Date.now();
+
+    // face-count check
+    if(predictions.length === 0){
+      if(!noFaceStart) noFaceStart = now;
+      if(now - noFaceStart > 10000){
+        appendLog('EVENT: No face present >10s');
+        sendEvent('no_face', {duration:10});
+        noFaceStart = null;
+      }
+    } else {
+      noFaceStart = null;
+      if(predictions.length > 1){
+        appendLog('EVENT: Multiple faces detected ('+predictions.length+')');
+        sendEvent('multiple_faces', {count: predictions.length});
+      }
+      // Look-away detection
+      const face = predictions[0];
+      if(face.landmarks && face.landmarks.length >= 6){
+        const leftEye = face.landmarks[0];
+        const rightEye = face.landmarks[1];
+        const nose = face.landmarks[2];
+        const eyeCenterX = (leftEye[0]+rightEye[0])/2;
+        const dx = nose[0] - eyeCenterX;
+        const faceWidth = Math.abs(face.bottomRight[0] - face.topLeft[0]) || 1;
+        const normalized = dx / faceWidth;
+        if(Math.abs(normalized) > 0.18){
+          if(!lookAwayStart) lookAwayStart = now;
+          if(now - lookAwayStart > 5000){
+            appendLog('EVENT: Looking away >5s');
+            sendEvent('looking_away', {});
+            lookAwayStart = null;
+          }
+        } else {
+          lookAwayStart = null;
+        }
+      }
+    }
+
+    // Object detection occasionally
+    if(Math.random() < 0.18){
+      const objPreds = await objModel.detect(video);
+      for(const p of objPreds){
+        const cls = p.class.toLowerCase();
+        if(['cell phone','book','cellphone','laptop','remote'].some(k => cls.includes(k))){
+          appendLog('EVENT: Object detected: ' + p.class + ' (' + Math.round(p.score*100) + '%)');
+          sendEvent('object_detected', {label:p.class, score:p.score});
+        }
+      }
+    }
+
+    setTimeout(detectLoop, checkIntervalMs);
+  }
+
+  async function init(){
+    await startCamera();
+    await loadModels();
+    detectLoop();
+  }
+  init();
+
+  // MediaRecorder: record the candidate video
+  document.getElementById('startRec').onclick = () => {
+    const stream = video.srcObject;
+    mediaRecorder = new MediaRecorder(stream, {mimeType:'video/webm'});
+    recordedChunks=[];
+    mediaRecorder.ondataavailable = (e) => { if(e.data.size>0) recordedChunks.push(e.data); };
+    mediaRecorder.onstop = () => {
+      const blob = new Blob(recordedChunks, {type:'video/webm'});
+      const fd = new FormData();
+      fd.append('file', blob, 'candidate.webm');
+      fetch('http://127.0.0.1:8080/api/upload-video', {
+        method:'POST',
+        body: fd
+      })
+      .then(()=>appendLog('Video uploaded'))
+      .catch(err => console.error('Upload failed:', err));
+    };
+    mediaRecorder.start();
+    document.getElementById('startRec').disabled = true;
+    document.getElementById('stopRec').disabled = false;
+    appendLog('Recording started');
+  };
+
+  document.getElementById('stopRec').onclick = () => {
+    mediaRecorder.stop();
+    document.getElementById('startRec').disabled = false;
+    document.getElementById('stopRec').disabled = true;
+    appendLog('Recording stopped');
+  };
+
+  // send event to backend
+  function sendEvent(type, extra){
+    const payload = {
+      candidateId: 'candidate_001',
+      event: type,
+      timestamp: new Date().toISOString(),
+      ...extra
+    };
+    fetch('http://127.0.0.1:8080/api/log', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    })
+    .then(res => res.json())
+    .then(data => console.log('Logged:', data))
+    .catch(err => console.warn('Log failed:', err));
+  }
+
+  // -------- Report Download --------
+  async function fetchReport() {
+    const res = await fetch("http://127.0.0.1:8080/api/report");
+    return await res.json();
+  }
+
+  async function downloadCSV() {
+    const data = await fetchReport();
+    let csv = "event,timestamp\n";
+    data.events.forEach(e => {
+      csv += `${e.event},${e.timestamp}\n`;
+    });
+    const blob = new Blob([csv], { type: "text/csv" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = "report.csv";
+    link.click();
+  }
+
+  async function downloadPDF() {
+    const data = await fetchReport();
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF();
+    doc.setFontSize(14);
+    doc.text("Event Report", 10, 10);
+    let y = 20;
+    data.events.forEach((e, i) => {
+      doc.text(`${i + 1}. ${e.event} - ${e.timestamp}`, 10, y);
+      y += 10;
+    });
+    doc.save("report.pdf");
+  }
+  </script>
+</body>
+</html>
